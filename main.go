@@ -9,8 +9,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/mattn/go-runewidth"
 	"github.com/patriceckhart/zot/packages/agent/ext"
 	"github.com/patriceckhart/zot/packages/tui"
+	"golang.org/x/term"
 )
 
 const name = "zot-question"
@@ -334,32 +336,98 @@ func (f *form) panelTitle() string {
 	return "Ask User"
 }
 
-// introLines renders the preamble with the same Markdown subset used by zot's
-// transcript and wraps the resulting ANSI text to the available terminal width.
-// Panel lines are otherwise opaque to the host: passing the whole intro as one
-// string makes a long preamble get clipped instead of reflowing.
-func (f *form) introLines() []string {
-	width := 80
+// contentWidth is the number of cells one panel row may occupy. zot clips
+// panel rows at the terminal width instead of reflowing them and never tells
+// an extension how wide its panel is, so the extension measures the terminal
+// itself. COLUMNS wins when it is set (an explicit override, and what tests
+// pin), the controlling terminal is next, and 80 is the conservative last
+// resort. The two-cell panel indent and a little right-side breathing room are
+// subtracted here, so callers can treat the result as the full row budget.
+func contentWidth() int {
+	width := 0
 	if columns := os.Getenv("COLUMNS"); columns != "" {
 		if n, err := strconv.Atoi(columns); err == nil && n > 0 {
 			width = n
 		}
 	}
-	// Keep the two-cell panel indent and a little right-side breathing room.
+	if width == 0 {
+		if measured, ok := ttyWidth(); ok {
+			width = measured
+		}
+	}
+	if width == 0 {
+		width = 80
+	}
 	width -= 4
 	if width < 1 {
 		width = 1
 	}
+	return width
+}
 
+// ttyWidth measures the terminal the panel is drawn in. Extension stdin and
+// stdout are pipes to zot, so the size has to come from the controlling
+// terminal (/dev/tty on unix, CONOUT$ on Windows). Measuring on every redraw
+// instead of once lets a terminal resize reflow the panel, which zot does not
+// announce to extensions.
+func ttyWidth() (int, bool) {
+	for _, path := range []string{"/dev/tty", "CONOUT$"} {
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		width, _, err := term.GetSize(int(f.Fd()))
+		_ = f.Close()
+		if err == nil && width > 0 {
+			return width, true
+		}
+	}
+	return 0, false
+}
+
+// wrapText folds text into panel rows that fit contentWidth(). first is
+// prepended to the first row and every continuation row is indented to the
+// same column, so wrapped text stays aligned under its own start. zot clips
+// panel rows instead of reflowing them, so anything that can grow with a
+// model-written prompt or a user-typed answer has to be wrapped here.
+// first must be plain text: it is measured, never wrapped.
+func wrapText(first, text string) []string {
+	// Tabs and carriage returns are not panel-friendly: the host counts row
+	// width in cells and runewidth scores a tab as zero, so expand tabs
+	// (over-estimating is safe) and drop CRs.
+	text = strings.ReplaceAll(text, "\t", "        ")
+	text = strings.ReplaceAll(text, "\r", "")
+
+	firstWidth := runewidth.StringWidth(first)
+	limit := contentWidth() - firstWidth
+	if limit < 1 {
+		limit = 1
+	}
+	indent := strings.Repeat(" ", firstWidth)
+
+	rows := make([]string, 0, 1)
+	for _, line := range strings.Split(text, "\n") {
+		for _, part := range tui.WrapANSILine(line, limit) {
+			if len(rows) == 0 {
+				rows = append(rows, first+part)
+				continue
+			}
+			rows = append(rows, indent+part)
+		}
+	}
+	return rows
+}
+
+// introLines renders the preamble with the same Markdown subset used by zot's
+// transcript and wraps the resulting ANSI text to the available panel width.
+// Panel lines are otherwise opaque to the host: passing the whole intro as one
+// string makes a long preamble get clipped instead of reflowing.
+func (f *form) introLines() []string {
+	width := contentWidth()
 	rendered := tui.RenderMarkdown(f.intro, tui.Dark, width)
 	result := make([]string, 0, strings.Count(rendered, "\n")+1)
 	for _, line := range strings.Split(rendered, "\n") {
-		wrapped := tui.WrapANSILine(line, width)
-		if len(wrapped) == 0 {
-			result = append(result, "  ")
-			continue
-		}
-		for _, part := range wrapped {
+		for _, part := range tui.WrapANSILine(line, width) {
 			result = append(result, "  "+part)
 		}
 	}
@@ -371,7 +439,9 @@ func (f *form) lines() []string {
 		return f.reviewLines()
 	}
 	q := f.questions[f.cursor]
-	lines := []string{f.breadcrumbs(), "", "  " + q.Prompt, ""}
+	lines := []string{f.breadcrumbs(), ""}
+	lines = append(lines, wrapText("  ", q.Prompt)...)
+	lines = append(lines, "")
 	if f.intro != "" && f.cursor == 0 {
 		lines = append(f.introLines(), lines...)
 	}
@@ -381,7 +451,9 @@ func (f *form) lines() []string {
 		if value == "" && q.Placeholder != "" {
 			value = "[" + q.Placeholder + "]"
 		}
-		lines = append(lines, "  "+value+"▌")
+		// The cursor rides along in the wrapped text, so a full last row
+		// pushes it onto a new row instead of clipping it.
+		lines = append(lines, wrapText("  ", value+"▌")...)
 	} else {
 		for i, o := range q.Options {
 			mark := "○"
@@ -398,18 +470,22 @@ func (f *form) lines() []string {
 			if i == f.option {
 				cursor = "› "
 			}
-			lines = append(lines, cursor+mark+" "+o.Label)
+			lines = append(lines, wrapText(cursor+mark+" ", o.Label)...)
 			if i == f.option && (o.Description != "" || o.Details != "") {
-				lines = append(lines, "    "+o.Description, "    "+o.Details)
+				lines = append(lines, wrapText("    ", o.Description)...)
+				lines = append(lines, wrapText("    ", o.Details)...)
 			}
 		}
 	}
 	if f.mode == "comment" {
-		lines = append(lines, "", "  Comment: "+f.comment+"▌")
+		lines = append(lines, "")
+		lines = append(lines, wrapText("  Comment: ", f.comment+"▌")...)
 	} else if f.mode == "option-comment" {
-		lines = append(lines, "", "  Option comment: "+f.comment+"▌")
+		lines = append(lines, "")
+		lines = append(lines, wrapText("  Option comment: ", f.comment+"▌")...)
 	} else if q.Comment != "" {
-		lines = append(lines, "", "  Comment: "+q.Comment)
+		lines = append(lines, "")
+		lines = append(lines, wrapText("  Comment: ", q.Comment)...)
 	}
 	return lines
 }
@@ -423,18 +499,10 @@ func (f *form) breadcrumbs() string {
 		plainSteps = append(plainSteps, fmt.Sprintf("%d %s %s", i+1, mark, q.Header))
 	}
 
-	// Extensions do not receive the panel width from zot. COLUMNS is the
-	// terminal width when it is available; 80 is a conservative fallback.
 	// Keep the stepper on one line only when the complete, unstyled content
-	// fits. This also lets a terminal resize naturally switch layouts on the
-	// next redraw.
-	width := 80
-	if columns := os.Getenv("COLUMNS"); columns != "" {
-		if n, err := strconv.Atoi(columns); err == nil && n > 0 {
-			width = n
-		}
-	}
-	if stepWidth := len("  ") + len(strings.Join(plainSteps, "   ")); stepWidth <= width-4 {
+	// fits; otherwise each step gets its own row. Re-measuring, rather than
+	// caching, lets a terminal resize naturally switch layouts.
+	if stepWidth := runewidth.StringWidth("  " + strings.Join(plainSteps, "   ")); stepWidth <= contentWidth() {
 		steps := make([]string, 0, len(f.questions))
 		for i, step := range plainSteps {
 			steps = append(steps, f.styleStep(i, step))
@@ -472,18 +540,20 @@ func (f *form) reviewLines() []string {
 	}
 	for i, q := range f.questions {
 		mark := "✓"
-		answer := f.answerText(q)
 		cursor := "  "
 		if i == f.cursor {
 			cursor = "› "
 		}
-		lines = append(lines, fmt.Sprintf("%s%s %s: %s", cursor, mark, q.Header, answer))
+		lines = append(lines, wrapText(fmt.Sprintf("%s%s %s: ", cursor, mark, q.Header), f.answerText(q))...)
 		if q.Comment != "" {
-			lines = append(lines, "    "+dimText("Comment: "+q.Comment))
+			for _, row := range wrapText("    ", "Comment: "+q.Comment) {
+				lines = append(lines, dimText(row))
+			}
 		}
 	}
 	if f.comment != "" {
-		lines = append(lines, "", "  Form comment: "+f.comment)
+		lines = append(lines, "")
+		lines = append(lines, wrapText("  Form comment: ", f.comment)...)
 	}
 	return lines
 }
