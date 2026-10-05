@@ -9,7 +9,10 @@ newer, which provides cancellable interactive extension tools.
 
 - One focused form containing 1–10 related questions.
 - Single-choice, multi-choice, and free-text questions.
-- Recommendations are preselected or prefilled and remain editable.
+- Recommendations are hints, never answers: a choice recommendation
+  preselects the option (select it to confirm) and a text recommendation is
+  shown as a placeholder. The question stays unanswered until you answer it
+  yourself.
 - Choice descriptions/details are shown beside the focused option.
 - Form, question, and option comments.
 - A review screen before submission.

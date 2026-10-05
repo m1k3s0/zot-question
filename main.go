@@ -19,11 +19,11 @@ const name = "zot-question"
 // version declared in extension.json.
 var version = "0.1.0"
 
-const schema = `{"type":"object","properties":{"title":{"type":"string","description":"Short decision title"},"intro":{"type":"string","description":"Context shown above the questions"},"questions":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"id":{"type":"string"},"type":{"type":"string","enum":["choice","text"]},"header":{"type":"string"},"prompt":{"type":"string"},"options":{"type":"array","items":{"type":"object","properties":{"value":{"type":"string"},"label":{"type":"string"},"description":{"type":"string"},"details":{"type":"string"}},"required":["value","label"]}},"multi":{"type":"boolean"},"recommendation":{} ,"placeholder":{"type":"string"}},"required":["id","type","header","prompt"]}}},"required":["questions"]}`
+const schema = `{"type":"object","properties":{"title":{"type":"string","description":"Short decision title"},"intro":{"type":"string","description":"Context shown above the questions"},"questions":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"id":{"type":"string"},"type":{"type":"string","enum":["choice","text"]},"header":{"type":"string"},"prompt":{"type":"string"},"options":{"type":"array","items":{"type":"object","properties":{"value":{"type":"string"},"label":{"type":"string"},"description":{"type":"string"},"details":{"type":"string"}},"required":["value","label"]}},"multi":{"type":"boolean"},"recommendation":{"description":"Suggested answer shown as a hint; never counts as an answer until the user selects an option or types their own text."},"placeholder":{"type":"string"}},"required":["id","type","header","prompt"]}}},"required":["questions"]}`
 
 type option struct {
 	Value, Label, Description, Details string
-	Selected                           bool
+	Selected, Recommended              bool
 	Comment                            string
 }
 type question struct {
@@ -100,10 +100,11 @@ func newForm(e *ext.Extension, in params) (*form, error) {
 		item := question{ID: q.ID, Type: q.Type, Header: q.Header, Prompt: q.Prompt, Placeholder: strings.TrimSpace(q.Placeholder), Multi: q.Multi}
 		switch q.Type {
 		case "text":
+			// A text recommendation is a hint, not an answer: surface it as the
+			// placeholder and leave the field empty and unanswered until the user
+			// types something themselves.
 			if s, ok := q.Recommendation.(string); ok {
-				item.Text = s
-				item.Recommendation = s
-				item.Answered = strings.TrimSpace(s) != ""
+				item.Recommendation = strings.TrimSpace(s)
 			}
 		case "choice":
 			if len(q.Options) < 2 || len(q.Options) > 12 {
@@ -118,22 +119,22 @@ func newForm(e *ext.Extension, in params) (*form, error) {
 			if q.Multi {
 				if values, ok := q.Recommendation.([]any); ok {
 					for _, v := range values {
-						f.selectValue(&item, fmt.Sprint(v))
+						f.recommendValue(&item, fmt.Sprint(v))
 					}
 				}
 			} else if s, ok := q.Recommendation.(string); ok {
-				item.Recommendation = s
-				f.selectValue(&item, s)
+				item.Recommendation = strings.TrimSpace(s)
+				f.recommendValue(&item, s)
 			}
-			if !q.Multi && !hasSelection(item.Options) {
-				item.Options[0].Selected = true
-			}
-			item.Answered = hasSelection(item.Options)
+			// A recommendation preselects an option as a visible suggestion but
+			// never counts as an answer: the question stays unanswered until the
+			// user selects an option themselves.
 		default:
 			return nil, fmt.Errorf("question %q has unsupported type %q", q.ID, q.Type)
 		}
 		f.questions = append(f.questions, item)
 	}
+	f.option = f.initialOption(0)
 	return f, nil
 }
 
@@ -145,9 +146,30 @@ func hasSelection(options []option) bool {
 	}
 	return false
 }
-func (f *form) selectValue(q *question, value string) {
+
+// initialOption returns the option the cursor should focus when the question at
+// index i becomes active: the recommended option when one is marked, otherwise
+// the first option.
+func (f *form) initialOption(i int) int {
+	if i < 0 || i >= len(f.questions) {
+		return 0
+	}
+	for j, o := range f.questions[i].Options {
+		if o.Recommended {
+			return j
+		}
+	}
+	return 0
+}
+
+// recommendValue marks the matching option as both suggested and preselected.
+// The preselection is only a visual hint; callers must not treat it as an
+// answer.
+func (f *form) recommendValue(q *question, value string) {
+	value = strings.TrimSpace(value)
 	for i := range q.Options {
-		if q.Options[i].Value == strings.TrimSpace(value) {
+		if q.Options[i].Value == value {
+			q.Options[i].Recommended = true
 			q.Options[i].Selected = true
 			return
 		}
@@ -192,29 +214,23 @@ func (f *form) key(pid, key, text string) {
 	case "left":
 		if f.cursor > 0 {
 			f.cursor--
-			f.option = 0
+			f.option = f.initialOption(f.cursor)
 		}
 	case "right", "tab":
 		if f.cursor < len(f.questions)-1 {
 			f.cursor++
-			f.option = 0
+			f.option = f.initialOption(f.cursor)
 		} else {
 			f.mode = "review"
 		}
 	case "backtab":
 		if f.cursor > 0 {
 			f.cursor--
+			f.option = f.initialOption(f.cursor)
 		}
 	case "space":
 		if q.Type == "choice" {
-			if q.Multi {
-				q.Options[f.option].Selected = !q.Options[f.option].Selected
-			} else {
-				for i := range q.Options {
-					q.Options[i].Selected = i == f.option
-				}
-			}
-			q.Answered = true
+			f.selectOption(q)
 		}
 	case "enter":
 		if len(f.questions) == 1 {
@@ -259,19 +275,35 @@ func (f *form) move(delta int) {
 		if f.option >= len(q.Options) {
 			f.option = 0
 		}
-	} else if delta != 0 {
-		if delta > 0 && f.cursor < len(f.questions)-1 {
-			f.cursor++
-		}
-		if delta < 0 && f.cursor > 0 {
-			f.cursor--
+		return
+	}
+	if delta > 0 && f.cursor < len(f.questions)-1 {
+		f.cursor++
+		f.option = f.initialOption(f.cursor)
+	}
+	if delta < 0 && f.cursor > 0 {
+		f.cursor--
+		f.option = f.initialOption(f.cursor)
+	}
+}
+
+// selectOption applies a spacebar press to the focused option. Only an explicit
+// selection counts as an answer, so toggling every option off returns the
+// question to unanswered.
+func (f *form) selectOption(q *question) {
+	if q.Multi {
+		q.Options[f.option].Selected = !q.Options[f.option].Selected
+	} else {
+		for i := range q.Options {
+			q.Options[i].Selected = i == f.option
 		}
 	}
+	q.Answered = hasSelection(q.Options)
 }
 func (f *form) next() {
 	if f.cursor < len(f.questions)-1 {
 		f.cursor++
-		f.option = 0
+		f.option = f.initialOption(f.cursor)
 	} else {
 		f.mode = "review"
 	}
@@ -305,6 +337,7 @@ func (f *form) reviewKey(pid, key, text string) {
 	case "left":
 		f.mode = "answer"
 		f.cursor = len(f.questions) - 1
+		f.option = f.initialOption(f.cursor)
 	case "up":
 		f.move(-1)
 	case "down":
@@ -317,6 +350,7 @@ func (f *form) reviewKey(pid, key, text string) {
 		case "e":
 			f.mode = "answer"
 			f.cursor = f.cursor % len(f.questions)
+			f.option = f.initialOption(f.cursor)
 		}
 	case "esc":
 		f.cancel("ask_user cancelled by user")
@@ -378,8 +412,17 @@ func (f *form) lines() []string {
 
 	if q.Type == "text" {
 		value := q.Text
-		if value == "" && q.Placeholder != "" {
-			value = "[" + q.Placeholder + "]"
+		if value == "" {
+			// A recommended answer is shown as a placeholder hint rather than
+			// being typed into the field, so the question stays unanswered until
+			// the user writes their own.
+			hint := q.Recommendation
+			if hint == "" {
+				hint = q.Placeholder
+			}
+			if hint != "" {
+				value = "[" + hint + "]"
+			}
 		}
 		lines = append(lines, "  "+value+"▌")
 	} else {
@@ -473,6 +516,10 @@ func (f *form) reviewLines() []string {
 	for i, q := range f.questions {
 		mark := "✓"
 		answer := f.answerText(q)
+		if !q.Answered {
+			mark = "○"
+			answer = dimText("unanswered")
+		}
 		cursor := "  "
 		if i == f.cursor {
 			cursor = "› "
