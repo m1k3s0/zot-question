@@ -371,7 +371,7 @@ func (f *form) lines() []string {
 		return f.reviewLines()
 	}
 	q := f.questions[f.cursor]
-	lines := []string{f.breadcrumbs(), "", "  " + q.Prompt, ""}
+	lines := append(f.breadcrumbLines(), "", "  "+q.Prompt, "")
 	if f.intro != "" && f.cursor == 0 {
 		lines = append(f.introLines(), lines...)
 	}
@@ -413,7 +413,13 @@ func (f *form) lines() []string {
 	}
 	return lines
 }
-func (f *form) breadcrumbs() string {
+
+// breadcrumbLines renders the stepper. It returns one slice element per
+// physical terminal row: the host treats each element of the panel lines as a
+// single row and never splits embedded newlines, so returning a multi-line
+// string here makes the diff renderer lose track of the cursor and paint the
+// steps as a diagonal staircase.
+func (f *form) breadcrumbLines() []string {
 	plainSteps := make([]string, 0, len(f.questions))
 	for i, q := range f.questions {
 		mark := "○"
@@ -441,14 +447,14 @@ func (f *form) breadcrumbs() string {
 		}
 		// Keep the line indented so a leading step number is not interpreted as
 		// an ordered-list marker by the panel renderer.
-		return "  " + strings.Join(steps, "   ")
+		return []string{"  " + strings.Join(steps, "   ")}
 	}
 
 	steps := make([]string, 0, len(f.questions))
 	for i, step := range plainSteps {
 		steps = append(steps, "  "+f.styleStep(i, step))
 	}
-	return strings.Join(steps, "\n")
+	return steps
 }
 
 func (f *form) styleStep(index int, step string) string {
@@ -466,7 +472,8 @@ func (f *form) styleStep(index int, step string) string {
 }
 
 func (f *form) reviewLines() []string {
-	lines := []string{"  Review your answers", "", f.breadcrumbs(), ""}
+	lines := append([]string{"  Review your answers", ""}, f.breadcrumbLines()...)
+	lines = append(lines, "")
 	if f.intro != "" {
 		lines = append(lines, f.introLines()...)
 	}
