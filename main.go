@@ -336,13 +336,17 @@ func (f *form) panelTitle() string {
 	return "Ask User"
 }
 
-// contentWidth is the number of cells one panel row may occupy. zot clips
-// panel rows at the terminal width instead of reflowing them and never tells
-// an extension how wide its panel is, so the extension measures the terminal
-// itself. COLUMNS wins when it is set (an explicit override, and what tests
-// pin), the controlling terminal is next, and 80 is the conservative last
-// resort. The two-cell panel indent and a little right-side breathing room are
-// subtracted here, so callers can treat the result as the full row budget.
+// contentWidth is the number of cells one panel row may occupy. zot never
+// tells an extension how wide its panel is, so the extension measures the
+// terminal itself. COLUMNS wins when it is set (an explicit override, and what
+// tests pin), the controlling terminal is next, and 80 is the conservative
+// last resort. The two-cell panel indent and a little right-side breathing
+// room are subtracted here, so callers can treat the result as the full row
+// budget.
+//
+// zot 0.4.7 and earlier also clip panel rows at the terminal width instead of
+// reflowing them; patriceckhart/zot#229 adds host-side wrapping. Measuring the
+// width here keeps the form correct on both the old and new behavior.
 func contentWidth() int {
 	width := 0
 	if columns := os.Getenv("COLUMNS"); columns != "" {
@@ -387,9 +391,13 @@ func ttyWidth() (int, bool) {
 
 // wrapText folds text into panel rows that fit contentWidth(). first is
 // prepended to the first row and every continuation row is indented to the
-// same column, so wrapped text stays aligned under its own start. zot clips
-// panel rows instead of reflowing them, so anything that can grow with a
-// model-written prompt or a user-typed answer has to be wrapped here.
+// same column, so wrapped text stays aligned under its own start.
+//
+// zot reflows panel rows as of patriceckhart/zot#229, so wrapping here is no
+// longer required to avoid clipping. It is still worth doing: the host wraps
+// on spaces and left-aligns continuation rows, which loses the hanging indent
+// under a row's prefix and can push a trailing cursor onto its own row. It
+// also keeps the form readable on zot releases that predate the host fix.
 // first must be plain text: it is measured, never wrapped.
 func wrapText(first, text string) []string {
 	// Tabs and carriage returns are not panel-friendly: the host counts row
@@ -420,8 +428,9 @@ func wrapText(first, text string) []string {
 
 // introLines renders the preamble with the same Markdown subset used by zot's
 // transcript and wraps the resulting ANSI text to the available panel width.
-// Panel lines are otherwise opaque to the host: passing the whole intro as one
-// string makes a long preamble get clipped instead of reflowing.
+// The host reflows panel rows as of patriceckhart/zot#229, but wrapping here
+// keeps the two-cell indent on every row and the intended Markdown layout, and
+// stops a long preamble from being clipped on older zot releases.
 func (f *form) introLines() []string {
 	width := contentWidth()
 	rendered := tui.RenderMarkdown(f.intro, tui.Dark, width)

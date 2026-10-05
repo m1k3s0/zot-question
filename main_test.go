@@ -14,8 +14,9 @@ var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 func plain(line string) string { return ansiRE.ReplaceAllString(line, "") }
 
 // maxRowWidth is the widest row the form may emit: the panel budget plus the
-// two-cell indent every row carries. Anything wider is clipped by zot at the
-// terminal width.
+// two-cell indent every row carries. Wider rows are wrapped by the host on
+// zot releases with patriceckhart/zot#229 and clipped on older ones, so the
+// form keeps every row inside the budget.
 func maxRowWidth() int { return contentWidth() + 2 }
 
 func checkWidths(t *testing.T, lines []string) {
